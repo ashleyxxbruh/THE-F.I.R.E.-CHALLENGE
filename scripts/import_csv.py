@@ -1,5 +1,9 @@
 """
-Run:
+Run (PowerShell):
+  $env:DATABASE_URL="postgresql+psycopg2://user:pass@localhost:5432/db"
+  python scripts/import_csv.py
+
+Run (bash):
   export DATABASE_URL=postgresql+psycopg2://user:pass@localhost:5432/db
   python scripts/import_csv.py
 """

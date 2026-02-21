@@ -1,5 +1,11 @@
 """
-Run:
+Run (PowerShell):
+  $env:DATABASE_URL="postgresql+psycopg2://user:pass@localhost:5432/db"
+  python scripts/enrich_ai.py
+  python scripts/enrich_ai.py --force
+  python scripts/enrich_ai.py --limit 10
+
+Run (bash):
   export DATABASE_URL=postgresql+psycopg2://user:pass@localhost:5432/db
   python scripts/enrich_ai.py
   python scripts/enrich_ai.py --force
