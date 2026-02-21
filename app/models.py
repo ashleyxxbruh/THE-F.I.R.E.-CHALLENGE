@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Optional
 
-from sqlalchemy import Date, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -18,8 +18,11 @@ class BusinessUnit(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
     address: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    lat: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    lon: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     managers: Mapped[list["Manager"]] = relationship(back_populates="business_unit")
+    assignments: Mapped[list["Assignment"]] = relationship(back_populates="business_unit")
 
 
 class Manager(Base):
@@ -36,6 +39,7 @@ class Manager(Base):
     current_load: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     business_unit: Mapped["BusinessUnit"] = relationship(back_populates="managers")
+    assignments: Mapped[list["Assignment"]] = relationship(back_populates="manager")
 
 
 class Ticket(Base):
@@ -55,6 +59,7 @@ class Ticket(Base):
     house_raw: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     ai_analysis: Mapped[Optional["AiAnalysis"]] = relationship(back_populates="ticket", uselist=False)
+    assignment: Mapped[Optional["Assignment"]] = relationship(back_populates="ticket", uselist=False)
 
 
 class AiAnalysis(Base):
@@ -73,3 +78,19 @@ class AiAnalysis(Base):
     raw_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
 
     ticket: Mapped["Ticket"] = relationship(back_populates="ai_analysis")
+
+
+class Assignment(Base):
+    __tablename__ = "assignments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id"), nullable=False, unique=True, index=True)
+    business_unit_id: Mapped[int] = mapped_column(ForeignKey("business_units.id"), nullable=False, index=True)
+    manager_id: Mapped[Optional[int]] = mapped_column(ForeignKey("managers.id"), nullable=True, index=True)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ASSIGNED")
+    reason: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+
+    ticket: Mapped["Ticket"] = relationship(back_populates="assignment")
+    business_unit: Mapped["BusinessUnit"] = relationship(back_populates="assignments")
+    manager: Mapped[Optional["Manager"]] = relationship(back_populates="assignments")
