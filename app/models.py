@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Optional
+from typing import Any, Optional
 
-from sqlalchemy import Date, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import Date, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -53,3 +53,23 @@ class Ticket(Base):
     city: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     street: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     house_raw: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    ai_analysis: Mapped[Optional["AiAnalysis"]] = relationship(back_populates="ticket", uselist=False)
+
+
+class AiAnalysis(Base):
+    __tablename__ = "ai_analysis"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id"), nullable=False, unique=True, index=True)
+    ticket_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    sentiment: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    language: Mapped[str] = mapped_column(String(8), nullable=False, default="RU")
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    recommendation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    lat: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    lon: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    raw_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+
+    ticket: Mapped["Ticket"] = relationship(back_populates="ai_analysis")
