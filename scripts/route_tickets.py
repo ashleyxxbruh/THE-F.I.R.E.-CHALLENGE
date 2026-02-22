@@ -207,7 +207,7 @@ def is_data_change(ticket_type: Any) -> bool:
 
 
 def is_main_specialist(position: Any) -> bool:
-    return normalize_spaces_lower(position) == normalize_spaces_lower("Глав спец")
+    return normalize_spaces_lower(position) == normalize_spaces_lower("Главный специалист")
 
 
 def manager_skills(manager: Manager) -> set[str]:
@@ -607,6 +607,64 @@ def eligible_managers_for_office(
     return eligible
 
 
+def choose_best_hub_office(
+    session,
+    offices: list[BusinessUnit],
+    filters: dict[str, Any],
+    bucket: str,
+    rr_state: dict[tuple[int, str], int],
+) -> tuple[Optional[BusinessUnit], list[Manager], dict[str, Any]]:
+    astana_office = find_astana_office(offices)
+    almaty_office = find_almaty_office(offices)
+
+    hub_offices: list[BusinessUnit] = []
+    for office in (astana_office, almaty_office):
+        if office is None:
+            continue
+        if all(existing.id != office.id for existing in hub_offices):
+            hub_offices.append(office)
+
+    hub_candidates_debug: list[dict[str, Any]] = []
+    eligible_hubs: list[tuple[BusinessUnit, list[Manager], int]] = []
+
+    for hub in hub_offices:
+        eligible = eligible_managers_for_office(session=session, office_id=hub.id, filters=filters)
+        top_two = eligible[:2]
+        top_loads = [int(manager.current_load) for manager in top_two]
+        score = sum(top_loads) if top_two else None
+        hub_candidates_debug.append(
+            {
+                "office": hub.name,
+                "eligible_count": len(eligible),
+                "top_loads": top_loads,
+                "score": score,
+            }
+        )
+        if score is not None:
+            eligible_hubs.append((hub, eligible, score))
+
+    debug_info: dict[str, Any] = {
+        "hub_candidates": hub_candidates_debug,
+        "hub_choice_rule": "min_sum_top2_loads",
+    }
+
+    if not eligible_hubs:
+        return None, [], debug_info
+
+    min_score = min(item[2] for item in eligible_hubs)
+    best_hubs = [item for item in eligible_hubs if item[2] == min_score]
+
+    if len(best_hubs) == 1:
+        best_office, best_eligible, _ = best_hubs[0]
+        return best_office, best_eligible, debug_info
+
+    tie_state_key = (-1, f"hub_rr:{bucket}")
+    toggle = rr_state.get(tie_state_key, 0) % len(best_hubs)
+    rr_state[tie_state_key] = (toggle + 1) % len(best_hubs)
+    best_office, best_eligible, _ = best_hubs[toggle]
+    return best_office, best_eligible, debug_info
+
+
 def pick_manager_with_rr(
     eligible: list[Manager],
     business_unit_id: int,
@@ -660,6 +718,7 @@ def process_ticket(
         "unassigned": 0,
         "fallback_50_50_count": 0,
         "nearest_office_count": 0,
+        "hub_fallback_count": 0,
         "office_name": None,
         "manager_id": None,
     }
@@ -670,19 +729,23 @@ def process_ticket(
 
     selected_office: Optional[BusinessUnit] = None
     office_choice = "nearest"
+    primary_office_choice = "nearest"
     office_fallback_mode = None
 
     if abroad_or_unknown or ticket_lat is None or ticket_lon is None:
         selected_office, office_fallback_mode = choose_fallback_office(offices, fallback_state)
         office_choice = "fallback_50_50"
+        primary_office_choice = office_choice
         result["fallback_50_50_count"] = 1
     else:
         selected_office = choose_nearest_office(ticket_lat, ticket_lon, offices)
         if selected_office is None:
             selected_office, office_fallback_mode = choose_fallback_office(offices, fallback_state)
             office_choice = "fallback_50_50"
+            primary_office_choice = office_choice
             result["fallback_50_50_count"] = 1
         else:
+            primary_office_choice = office_choice
             result["nearest_office_count"] = 1
 
     if selected_office is None:
@@ -703,6 +766,36 @@ def process_ticket(
                     office_id=office.id,
                     filters=filters,
                 )
+                primary_eligible_count = len(eligible)
+                primary_office_info = {
+                    "id": office.id,
+                    "name": office.name,
+                    "choice": primary_office_choice,
+                    "eligible_count": primary_eligible_count,
+                }
+                hub_debug: Optional[dict[str, Any]] = None
+                hub_fallback_used = False
+
+                if not eligible:
+                    hub_candidate_offices = [item for item in offices if item.id != office.id]
+                    hub_office, hub_eligible, hub_debug = choose_best_hub_office(
+                        session=session,
+                        offices=hub_candidate_offices,
+                        filters=filters,
+                        bucket=bucket,
+                        rr_state=rr_state,
+                    )
+                    if hub_office is not None and hub_eligible:
+                        rerouted_office = session.get(BusinessUnit, hub_office.id)
+                        if rerouted_office is None:
+                            raise RuntimeError(f"Hub office id {hub_office.id} not found during assignment")
+                        office = rerouted_office
+                        eligible = hub_eligible
+                        office_choice = "hub_fallback"
+                        office_fallback_mode = "no_eligible_in_primary_office"
+                        hub_fallback_used = True
+                        result["hub_fallback_count"] = 1
+
                 selected_manager, rr_key = pick_manager_with_rr(
                     eligible=eligible,
                     business_unit_id=office.id,
@@ -713,12 +806,20 @@ def process_ticket(
                 status = STATUS_ASSIGNED if selected_manager is not None else STATUS_UNASSIGNED
                 unassigned_reason = None
                 if selected_manager is None:
-                    unassigned_reason = "no_eligible_managers"
+                    if primary_eligible_count == 0:
+                        unassigned_reason = "no_eligible_managers_even_in_hubs"
+                    else:
+                        unassigned_reason = "no_eligible_managers"
 
                 reason = {
                     "office_choice": office_choice,
                     "office_name": office.name,
                     "office_fallback_mode": office_fallback_mode,
+                    "primary_office": primary_office_info,
+                    "hub_fallback": {
+                        "used": hub_fallback_used,
+                        "hub_debug": hub_debug if hub_debug else None,
+                    },
                     "filters": filters,
                     "eligible_managers_count": len(eligible),
                     "rr_key": rr_key,
@@ -805,6 +906,7 @@ def main() -> None:
         print("unassigned: 0")
         print("fallback_50_50_count: 0")
         print("nearest_office_count: 0")
+        print("hub_fallback_count: 0")
         print("per-office assigned counts:")
         print("per-manager final loads:")
         return
@@ -821,6 +923,7 @@ def main() -> None:
     unassigned = 0
     fallback_50_50_count = 0
     nearest_office_count = 0
+    hub_fallback_count = 0
 
     for ticket, ai_analysis in ticket_rows:
         processed += 1
@@ -837,6 +940,7 @@ def main() -> None:
             unassigned += int(item["unassigned"])
             fallback_50_50_count += int(item["fallback_50_50_count"])
             nearest_office_count += int(item["nearest_office_count"])
+            hub_fallback_count += int(item["hub_fallback_count"])
             if item["assigned"] and item["office_name"]:
                 per_office_assigned[item["office_name"]] += 1
         except Exception as exc:  # pragma: no cover
@@ -854,6 +958,7 @@ def main() -> None:
     print(f"unassigned: {unassigned}")
     print(f"fallback_50_50_count: {fallback_50_50_count}")
     print(f"nearest_office_count: {nearest_office_count}")
+    print(f"hub_fallback_count: {hub_fallback_count}")
     print("per-office assigned counts:")
     for office_name, count in sorted(per_office_assigned.items(), key=lambda x: x[0]):
         print(f"  {office_name}: {count}")
