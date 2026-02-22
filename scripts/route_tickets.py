@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -49,6 +50,47 @@ KAZAKHSTAN_ALIASES = {"казахстан", "kazakhstan", "kz", "рк", "rk"}
 
 ALMATY_COORDS = (43.238949, 76.889709)
 ASTANA_COORDS = (51.169392, 71.449074)
+OFFICE_CENTROIDS: dict[str, tuple[float, float]] = {
+    "актау": (43.6511, 51.1978),
+    "актобе": (50.2839, 57.1669),
+    "алматы": ALMATY_COORDS,
+    "астана": ASTANA_COORDS,
+    "атырау": (47.1126, 51.9235),
+    "караганда": (49.8047, 73.1094),
+    "кокшетау": (53.2833, 69.3833),
+    "костанай": (53.2144, 63.6246),
+    "кызылорда": (44.8488, 65.4823),
+    "павлодар": (52.2873, 76.9674),
+    "петропавловск": (54.8753, 69.1628),
+    "тараз": (42.9006, 71.3658),
+    "уральск": (51.2278, 51.3865),
+    "усть каменогорск": (49.9483, 82.6289),
+    "шымкент": (42.3417, 69.5901),
+    # aliases
+    "нур султан": ASTANA_COORDS,
+    "орал": (51.2278, 51.3865),
+    "оскемен": (49.9483, 82.6289),
+}
+OFFICE_CITY_LABELS: dict[str, str] = {
+    "актау": "Актау",
+    "актобе": "Актобе",
+    "алматы": "Алматы",
+    "астана": "Астана",
+    "атырау": "Атырау",
+    "караганда": "Караганда",
+    "кокшетау": "Кокшетау",
+    "костанай": "Костанай",
+    "кызылорда": "Кызылорда",
+    "павлодар": "Павлодар",
+    "петропавловск": "Петропавловск",
+    "тараз": "Тараз",
+    "уральск": "Уральск",
+    "усть каменогорск": "Усть-Каменогорск",
+    "шымкент": "Шымкент",
+    "нур султан": "Астана",
+    "орал": "Уральск",
+    "оскемен": "Усть-Каменогорск",
+}
 
 
 def configure_logging(debug: bool) -> None:
@@ -70,6 +112,33 @@ def normalize_spaces_lower(value: Any) -> str:
     if not text:
         return ""
     return " ".join(text.split()).lower()
+
+
+def normalize_geo_lookup_text(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    printable = "".join(ch if ch.isprintable() else " " for ch in text)
+    lowered = printable.lower().replace("ё", "е")
+    lowered = lowered.replace("нур-султан", "нур султан")
+    lowered = re.sub(r"[«»\"'`]", " ", lowered)
+    lowered = re.sub(r"[-_/]", " ", lowered)
+    lowered = re.sub(r"[.,;:(){}\[\]]", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    if "нур султан" in lowered:
+        lowered = lowered.replace("нур султан", "астана")
+    return lowered
+
+
+def match_office_city(office_name: Any) -> tuple[Optional[str], Optional[tuple[float, float]]]:
+    normalized = normalize_geo_lookup_text(office_name)
+    if not normalized:
+        return None, None
+
+    for city_key, coords in OFFICE_CENTROIDS.items():
+        if city_key in normalized:
+            return OFFICE_CITY_LABELS.get(city_key, city_key.title()), coords
+    return None, None
 
 
 def clean_int(value: Any, default: int = 0) -> int:
@@ -216,15 +285,49 @@ def geocode_address(address: str, cache: dict[str, Optional[tuple[float, float]]
     return None
 
 
-def office_city_centroid(office_name: Any) -> Optional[tuple[float, float]]:
-    name = normalize_spaces_lower(office_name)
-    if not name:
+def clean_office_address_for_nominatim(address: Optional[str], office_name: str) -> Optional[str]:
+    city_label, _ = match_office_city(office_name)
+    city = city_label or clean_text(office_name)
+    if not city:
         return None
-    if "алматы" in name:
-        return ALMATY_COORDS
-    if "астана" in name or "нур-султан" in name or "нур султан" in name:
-        return ASTANA_COORDS
-    return None
+
+    raw_address = clean_text(address)
+    if not raw_address:
+        return f"{city}, Kazakhstan"
+
+    cleaned = "".join(ch if ch.isprintable() else " " for ch in raw_address)
+    cleaned = cleaned.replace("«", " ").replace("»", " ").replace('"', " ")
+    cleaned = cleaned.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    cleaned = re.sub(r"\bг\.\s*", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:район|р-н)\b[^,;]*", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:бизнес[\s-]*центр|бц)\b[^,;]*", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b\d+\s*[-–—]?\s*(?:й|ый|ий)?\s*этаж\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bэтаж\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bофис\b\s*№?\s*[\w/-]*", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bмикрорайон\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bмкр\b\.?", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\s*,\s*", ", ", cleaned).strip(" ,.-")
+
+    segments = [seg.strip(" .,-") for seg in re.split(r"[;,]", cleaned) if clean_text(seg)]
+    primary = ""
+    if segments:
+        primary = segments[0]
+        if not re.search(r"\d", primary) and len(segments) > 1:
+            primary = f"{primary} {segments[1]}".strip()
+
+    primary = re.sub(r"\b(?:обл|область)\b\.?", " ", primary, flags=re.IGNORECASE)
+    primary = re.sub(r"\s+", " ", primary).strip(" ,.-")
+    primary = primary.replace("Қ", "К").replace("қ", "к").replace("Ә", "А").replace("ә", "а")
+
+    if not primary:
+        return f"{city}, Kazakhstan"
+    return f"{primary}, {city}, Kazakhstan"
+
+
+def office_city_centroid(office_name: Any) -> Optional[tuple[float, float]]:
+    _, coords = match_office_city(office_name)
+    return coords
 
 
 def ensure_office_coordinates(skip_geocode: bool) -> None:
@@ -241,17 +344,17 @@ def ensure_office_coordinates(skip_geocode: bool) -> None:
                 source: Optional[str] = None
 
                 if not skip_geocode:
-                    address = clean_text(office.address)
-                    if address:
-                        coords = geocode_address(address, address_cache)
+                    query = clean_office_address_for_nominatim(office.address, office.name)
+                    if query:
+                        coords = geocode_address(query, address_cache)
                         if coords is not None:
-                            source = "nominatim"
+                            source = "nominatim_cleaned"
 
                 if coords is None:
                     centroid = office_city_centroid(office.name)
                     if centroid is not None:
                         coords = centroid
-                        source = "city_centroid"
+                        source = "centroid_map"
 
                 if coords is not None:
                     office.lat = coords[0]
