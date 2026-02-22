@@ -3,7 +3,6 @@ Run (PowerShell):
   $env:DATABASE_URL="postgresql+psycopg2://user:pass@localhost:5432/db"
   $env:GROQ_API_KEY="your_groq_api_key"
   $env:GROQ_MODEL="llama-3.3-70b-versatile"
-  $env:GOOGLE_API_KEY="your_google_ai_studio_key"
   python scripts/enrich_ai.py
   python scripts/enrich_ai.py --force
   python scripts/enrich_ai.py --limit 10
@@ -12,7 +11,6 @@ Run (bash):
   export DATABASE_URL=postgresql+psycopg2://user:pass@localhost:5432/db
   export GROQ_API_KEY=your_groq_api_key
   export GROQ_MODEL=llama-3.3-70b-versatile
-  export GOOGLE_API_KEY=your_google_ai_studio_key
   python scripts/enrich_ai.py
   python scripts/enrich_ai.py --force
   python scripts/enrich_ai.py --limit 10
@@ -68,6 +66,34 @@ DEFAULT_SENTIMENT = "Нейтральный"
 DEFAULT_PRIORITY = 5
 DEFAULT_LANGUAGE = "RU"
 DEFAULT_RECOMMENDATION = "Проверьте детали обращения и уточните информацию у клиента."
+OVERRIDE_RULE_A_BLOCK_KEYWORDS = ("заблок", "блокиров", "счет", "счёт", "карта", "доступ")
+OVERRIDE_RULE_A_COMPENSATION_KEYWORDS = ("верните", "возмест", "компенс", "ущерб", "требую", "суд", "претенз")
+OVERRIDE_RULE_B_KEYWORDS = (
+    "смена номера",
+    "изменить номер",
+    "номер телефона",
+    "смс не приходит",
+    "код не приходит",
+    "верификац",
+    "паспорт",
+    "иин",
+    "документ",
+    "обновить данные",
+)
+OVERRIDE_RULE_C_KEYWORDS = ("мошенн", "обман", "развод", "жертва", "украли", "списали", "фишинг", "злоумышлен")
+OVERRIDE_RULE_D_KEYWORDS = (
+    "ордер",
+    "order",
+    "не исполнил",
+    "ошибка исполнения",
+    "не работает",
+    "bug",
+    "ошибка",
+    "краш",
+    "зависло",
+)
+OVERRIDE_RULE_E_TRANSFER_KEYWORDS = ("перевод не приш", "не поступил", "завис перевод")
+OVERRIDE_RULE_E_CURRENCY_KEYWORDS = ("тг", "₸", "руб", "₽", "usd", "$", "евро", "€")
 
 ALMATY_COORDS = (43.238949, 76.889709)
 ASTANA_COORDS = (51.169392, 71.449074)
@@ -183,6 +209,96 @@ def validate_ai_payload(payload: Any, description: Optional[str]) -> tuple[dict[
     return result, payload, False
 
 
+def _normalize_text_for_override(*parts: Optional[str]) -> str:
+    values = [clean_text(part) for part in parts]
+    values = [value for value in values if value]
+    if not values:
+        return ""
+    normalized = " ".join(values).lower().replace("ё", "е")
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _keyword_hits(text: str, keywords: tuple[str, ...]) -> list[str]:
+    return [keyword for keyword in keywords if keyword in text]
+
+
+def apply_type_overrides(description: str, ai: dict[str, Any]) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+    updated = dict(ai)
+    text = _normalize_text_for_override(description, updated.get("summary"))
+    original_type = normalize_ticket_type(updated.get("ticket_type"))
+    original_priority = normalize_priority(updated.get("priority"))
+
+    updated["ticket_type"] = original_type
+    updated["priority"] = original_priority
+
+    if not text:
+        return updated, None
+
+    block_hits = _keyword_hits(text, OVERRIDE_RULE_A_BLOCK_KEYWORDS)
+    compensation_hits = _keyword_hits(text, OVERRIDE_RULE_A_COMPENSATION_KEYWORDS)
+    rule_b_hits = _keyword_hits(text, OVERRIDE_RULE_B_KEYWORDS)
+    fraud_hits = _keyword_hits(text, OVERRIDE_RULE_C_KEYWORDS)
+    rule_d_hits = _keyword_hits(text, OVERRIDE_RULE_D_KEYWORDS)
+    transfer_hits = _keyword_hits(text, OVERRIDE_RULE_E_TRANSFER_KEYWORDS)
+    currency_hits = _keyword_hits(text, OVERRIDE_RULE_E_CURRENCY_KEYWORDS)
+    has_large_number = bool(re.search(r"\b\d{3,}\b", text))
+
+    new_type = original_type
+    new_priority = original_priority
+    rule_id: Optional[str] = None
+    matched_keywords: list[str] = []
+
+    if fraud_hits:
+        rule_id = "RULE_C_FRAUD_VICTIM"
+        new_type = "Мошеннические действия"
+        new_priority = max(original_priority, 9)
+        matched_keywords = fraud_hits
+    elif rule_b_hits:
+        rule_id = "RULE_B_CHANGE_DATA"
+        new_type = "Смена данных"
+        new_priority = min(max(original_priority, 5), 10)
+        matched_keywords = rule_b_hits
+    elif transfer_hits and (currency_hits or has_large_number):
+        rule_id = "RULE_E_TRANSFER_CLAIM"
+        new_type = "Претензия"
+        new_priority = max(original_priority, 7)
+        matched_keywords = transfer_hits + currency_hits + (["amount_3plus"] if has_large_number else [])
+    elif rule_d_hits:
+        rule_id = "RULE_D_APP_NOT_WORKING"
+        new_type = "Неработоспособность приложения"
+        new_priority = max(original_priority, 7)
+        matched_keywords = rule_d_hits
+    elif block_hits and not compensation_hits:
+        rule_id = "RULE_A_BLOCKED_ACCOUNT_COMPLAINT"
+        new_type = "Жалоба"
+        new_priority = original_priority
+        matched_keywords = block_hits
+
+    new_type = normalize_ticket_type(new_type)
+    if new_type not in ALLOWED_TICKET_TYPES:
+        new_type = DEFAULT_TICKET_TYPE
+    new_priority = normalize_priority(new_priority)
+
+    if rule_id is None:
+        return updated, None
+    if new_type == original_type and new_priority == original_priority:
+        return updated, None
+
+    updated["ticket_type"] = new_type
+    updated["priority"] = new_priority
+
+    override_reason = {
+        "applied": True,
+        "original_type": original_type,
+        "new_type": new_type,
+        "original_priority": original_priority,
+        "new_priority": new_priority,
+        "rule_id": rule_id,
+        "matched_keywords": matched_keywords,
+    }
+    return updated, override_reason
+
+
 def _build_llm_prompt(description: str) -> str:
     prompt_description = description.strip() if description else ""
     ticket_types = ", ".join(sorted(ALLOWED_TICKET_TYPES))
@@ -223,48 +339,6 @@ def _parse_json_response_text(text: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise LLMAdapterError("LLM response is not a JSON object")
     return parsed
-
-
-def _call_openai_llm(description: str, api_key: str) -> dict[str, Any]:
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    prompt = _build_llm_prompt(description)
-
-    payload = {
-        "model": model,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {
-                "role": "system",
-                "content": "Return only a valid JSON object.",
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-        "temperature": 0.2,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    try:
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        return _parse_json_response_text(content)
-    except RequestException as exc:
-        raise LLMAdapterError(f"OpenAI network error: {exc}") from exc
-    except (KeyError, IndexError, TypeError) as exc:
-        raise LLMAdapterError(f"OpenAI response parse error: {exc}") from exc
 
 
 def _call_groq_llm(description: str, api_key: str) -> dict[str, Any]:
@@ -327,104 +401,16 @@ def _call_groq_llm(description: str, api_key: str) -> dict[str, Any]:
     raise LLMAdapterError(f"Groq request failed: {joined}")
 
 
-def _gemini_models_from_env() -> list[str]:
-    raw = clean_text(os.getenv("GEMINI_MODEL"))
-    if not raw:
-        return ["gemini-2.5-flash", "gemini-2.0-flash"]
-    models = [item.strip() for item in raw.split(",") if item.strip()]
-    return models if models else ["gemini-2.5-flash", "gemini-2.0-flash"]
-
-
-def _gemini_response_text(data: dict[str, Any]) -> str:
-    candidates = data.get("candidates")
-    if not isinstance(candidates, list) or not candidates:
-        raise LLMAdapterError(f"Gemini response missing candidates: {data}")
-    first = candidates[0]
-    content = first.get("content") if isinstance(first, dict) else None
-    parts = content.get("parts") if isinstance(content, dict) else None
-    if not isinstance(parts, list) or not parts:
-        raise LLMAdapterError(f"Gemini response missing text parts: {data}")
-    text_part = parts[0]
-    text = text_part.get("text") if isinstance(text_part, dict) else None
-    if not isinstance(text, str):
-        raise LLMAdapterError(f"Gemini response text is empty: {data}")
-    return text
-
-
-def _call_gemini_llm(description: str, api_key: str) -> dict[str, Any]:
-    prompt = _build_llm_prompt(description)
-    model_candidates = _gemini_models_from_env()
-    payload_candidates = [
-        {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.2,
-                "responseMimeType": "application/json",
-            },
-        },
-        {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.2,
-            },
-        },
-        {
-            "contents": [{"parts": [{"text": prompt}]}],
-        },
-    ]
-
-    errors: list[str] = []
-    for model in model_candidates:
-        for payload in payload_candidates:
-            try:
-                response = requests.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                    params={"key": api_key},
-                    headers={"Content-Type": "application/json"},
-                    json=payload,
-                    timeout=30,
-                )
-                if not response.ok:
-                    body_preview = (response.text or "").strip().replace("\n", " ")
-                    errors.append(f"model={model} status={response.status_code} body={body_preview[:300]}")
-                    continue
-                data = response.json()
-                content = _gemini_response_text(data)
-                return _parse_json_response_text(content)
-            except RequestException as exc:
-                errors.append(f"model={model} request_error={exc}")
-                continue
-            except ValueError as exc:
-                errors.append(f"model={model} non_json_response={exc}")
-                continue
-            except LLMAdapterError as exc:
-                errors.append(f"model={model} parse_error={exc}")
-                continue
-
-    joined = "; ".join(errors[-3:]) if errors else "unknown error"
-    raise LLMAdapterError(f"Gemini request failed for all model/payload options: {joined}")
-
-
 def call_llm(description: str) -> dict[str, Any]:
     if requests is None:
         raise LLMAdapterError("requests library is not installed")
 
     groq_api_key = os.getenv("GROQ_API_KEY")
-    google_api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    openai_api_key = os.getenv("OPENAI_API_KEY")
 
     if groq_api_key:
         return _call_groq_llm(description, groq_api_key)
 
-    if google_api_key:
-        return _call_gemini_llm(description, google_api_key)
-
-    if openai_api_key:
-        return _call_openai_llm(description, openai_api_key)
-
-    raise LLMAdapterError(
-        "No LLM API key set. Use GROQ_API_KEY / GOOGLE_API_KEY (or GEMINI_API_KEY) / OPENAI_API_KEY."
-    )
+    raise LLMAdapterError("GROQ_API_KEY is not set")
 
 
 def _join_geo_parts(*parts: Optional[str]) -> Optional[str]:
@@ -644,11 +630,42 @@ def upsert_ai_analysis(session, values: dict[str, Any]) -> None:
     session.execute(stmt)
 
 
+def run_self_check_types(tickets: list[Ticket]) -> None:
+    override_counts: dict[str, int] = {}
+    processed = 0
+    ai_call_failures = 0
+
+    for ticket in tickets:
+        processed += 1
+        raw_payload: Any = None
+        try:
+            raw_payload = call_llm(ticket.description or "")
+        except LLMAdapterError as exc:
+            ai_call_failures += 1
+            logger.warning("AI call failed for ticket %s during type self-check: %s", ticket.client_guid, exc)
+
+        normalized, _, _ = validate_ai_payload(raw_payload, ticket.description)
+        _, override_reason = apply_type_overrides(ticket.description or "", normalized)
+        if override_reason is not None:
+            rule_id = str(override_reason["rule_id"])
+            override_counts[rule_id] = override_counts.get(rule_id, 0) + 1
+
+    print("\nType Override Self-Check")
+    print(f"processed: {processed}")
+    print(f"ai_call_failures: {ai_call_failures}")
+    print("overrides by rule:")
+    if not override_counts:
+        print("  none")
+        return
+    for rule_id, count in sorted(override_counts.items(), key=lambda x: x[0]):
+        print(f"  {rule_id}: {count}")
+
+
 def process_ticket(
     ticket: Ticket,
     geocode_cache: dict[str, Optional[tuple[float, float]]],
     debug: bool,
-) -> tuple[bool, int, int, int]:
+) -> tuple[bool, int, int, int, Optional[str]]:
     failed_ai_parses = 0
     failed_geocodes = 0
     used_fallback_city_centroid = 0
@@ -666,6 +683,27 @@ def process_ticket(
     if invalid_json and not ai_call_failed:
         failed_ai_parses += 1
         logger.warning("Invalid AI JSON for ticket %s. Applied fallback defaults.", ticket.client_guid)
+
+    normalized, override_reason = apply_type_overrides(ticket.description or "", normalized)
+    if override_reason is not None:
+        logger.info(
+            "Type override for ticket %s: %s -> %s (rule=%s)",
+            ticket.client_guid,
+            override_reason["original_type"],
+            override_reason["new_type"],
+            override_reason["rule_id"],
+        )
+
+    raw_json_to_store: Any = raw_json if raw_json is not None else (raw_payload if isinstance(raw_payload, dict) else None)
+    if override_reason is not None:
+        if isinstance(raw_json, dict):
+            raw_json_to_store = dict(raw_json)
+            raw_json_to_store["override"] = override_reason
+        else:
+            raw_json_to_store = {
+                "llm": raw_json if raw_json is not None else (raw_payload if isinstance(raw_payload, dict) else None),
+                "override": override_reason,
+            }
 
     geocode_queries = build_geocode_queries(ticket)
     coords, geocode_query = geocode_nominatim(geocode_queries, geocode_cache)
@@ -709,7 +747,7 @@ def process_ticket(
         "recommendation": normalized["recommendation"],
         "lat": lat,
         "lon": lon,
-        "raw_json": raw_json if raw_json is not None else (raw_payload if isinstance(raw_payload, dict) else None),
+        "raw_json": raw_json_to_store,
     }
 
     try:
@@ -721,9 +759,13 @@ def process_ticket(
             logger.exception("Database upsert failed for ticket %s", ticket.client_guid)
         else:
             logger.error("Database upsert failed for ticket %s: %s", ticket.client_guid, exc)
-        return False, failed_ai_parses, failed_geocodes, used_fallback_city_centroid
+        return False, failed_ai_parses, failed_geocodes, used_fallback_city_centroid, (
+            override_reason["rule_id"] if override_reason else None
+        )
 
-    return True, failed_ai_parses, failed_geocodes, used_fallback_city_centroid
+    return True, failed_ai_parses, failed_geocodes, used_fallback_city_centroid, (
+        override_reason["rule_id"] if override_reason else None
+    )
 
 
 def main() -> None:
@@ -732,6 +774,11 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="Re-enrich tickets even when ai_analysis exists.")
     parser.add_argument("--limit", type=int, help="Maximum number of tickets to process.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logs and exception traces.")
+    parser.add_argument(
+        "--self-check-types",
+        action="store_true",
+        help="Dry-run type override checks and print override counts by rule (no DB writes).",
+    )
     args = parser.parse_args()
 
     configure_logging(debug=args.debug)
@@ -739,6 +786,10 @@ def main() -> None:
 
     tickets = select_tickets(force=args.force, tickets_arg=args.tickets, limit=args.limit)
     total_selected = len(tickets)
+
+    if args.self_check_types:
+        run_self_check_types(tickets)
+        return
 
     processed = 0
     successes = 0
@@ -751,7 +802,7 @@ def main() -> None:
     for ticket in tickets:
         processed += 1
         try:
-            ok, ai_fail_cnt, geocode_fail_cnt, fallback_cnt = process_ticket(
+            ok, ai_fail_cnt, geocode_fail_cnt, fallback_cnt, _override_rule_id = process_ticket(
                 ticket=ticket,
                 geocode_cache=geocode_cache,
                 debug=args.debug,

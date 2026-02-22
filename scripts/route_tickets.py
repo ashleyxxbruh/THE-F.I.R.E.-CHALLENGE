@@ -867,13 +867,16 @@ def choose_office_for_ticket(
 
     if region_candidate_offices:
         if ticket_lat is not None and ticket_lon is not None:
-            chosen = min(
-                region_candidate_offices,
-                key=lambda office: haversine_km(ticket_lat, ticket_lon, float(office.lat), float(office.lon))
-                if office.lat is not None and office.lon is not None
-                else float("inf"),
-            )
-            return chosen, "region_candidate_nearest", None, region_candidates_debug
+            candidates_with_coords = [
+                office for office in region_candidate_offices if office.lat is not None and office.lon is not None
+            ]
+            if candidates_with_coords:
+                chosen = min(
+                    candidates_with_coords,
+                    key=lambda office: haversine_km(ticket_lat, ticket_lon, float(office.lat), float(office.lon)),
+                )
+                return chosen, "region_candidate_nearest", None, region_candidates_debug
+            return region_candidate_offices[0], "region_candidate_no_coords", None, region_candidates_debug
 
         if len(region_candidate_offices) == 1:
             return region_candidate_offices[0], "region_candidate_no_coords", None, region_candidates_debug
@@ -1345,6 +1348,11 @@ def main() -> None:
         help="Run lightweight post-routing assertions for spam drop invariants.",
     )
     parser.add_argument(
+        "--self-check-geo",
+        action="store_true",
+        help="Dry-run office choice printout for known problematic ticket ids.",
+    )
+    parser.add_argument(
         "--print-spam",
         action="store_true",
         help="Print dropped spam tickets with source and heuristic score.",
@@ -1375,6 +1383,9 @@ def main() -> None:
         print("per-office assigned counts:")
         print("per-manager final loads:")
         return
+
+    if args.self_check_geo:
+        run_geo_self_check(offices)
 
     ticket_rows = select_tickets(force=args.force, tickets_arg=args.tickets, limit=args.limit)
 
