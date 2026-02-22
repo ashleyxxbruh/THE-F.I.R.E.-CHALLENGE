@@ -1,6 +1,8 @@
 """
 Run (PowerShell):
   $env:DATABASE_URL="postgresql+psycopg2://user:pass@localhost:5432/db"
+  $env:GROQ_API_KEY="your_groq_api_key"
+  $env:GROQ_MODEL="llama-3.3-70b-versatile"
   $env:GOOGLE_API_KEY="your_google_ai_studio_key"
   python scripts/enrich_ai.py
   python scripts/enrich_ai.py --force
@@ -8,6 +10,8 @@ Run (PowerShell):
 
 Run (bash):
   export DATABASE_URL=postgresql+psycopg2://user:pass@localhost:5432/db
+  export GROQ_API_KEY=your_groq_api_key
+  export GROQ_MODEL=llama-3.3-70b-versatile
   export GOOGLE_API_KEY=your_google_ai_studio_key
   python scripts/enrich_ai.py
   python scripts/enrich_ai.py --force
@@ -237,6 +241,66 @@ def _call_openai_llm(description: str, api_key: str) -> dict[str, Any]:
         raise LLMAdapterError(f"OpenAI response parse error: {exc}") from exc
 
 
+def _call_groq_llm(description: str, api_key: str) -> dict[str, Any]:
+    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    prompt = _build_llm_prompt(description)
+    base_payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Return only a valid JSON object.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        "temperature": 0.2,
+    }
+    payload_candidates = [
+        {
+            **base_payload,
+            "response_format": {"type": "json_object"},
+        },
+        base_payload,
+    ]
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    errors: list[str] = []
+    for payload in payload_candidates:
+        try:
+            response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+            if not response.ok:
+                body_preview = (response.text or "").strip().replace("\n", " ")
+                errors.append(f"status={response.status_code} body={body_preview[:300]}")
+                continue
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            return _parse_json_response_text(content)
+        except RequestException as exc:
+            errors.append(f"request_error={exc}")
+            continue
+        except ValueError as exc:
+            errors.append(f"non_json_response={exc}")
+            continue
+        except (KeyError, IndexError, TypeError, LLMAdapterError) as exc:
+            errors.append(f"parse_error={exc}")
+            continue
+
+    joined = "; ".join(errors[-2:]) if errors else "unknown error"
+    raise LLMAdapterError(f"Groq request failed: {joined}")
+
+
 def _gemini_models_from_env() -> list[str]:
     raw = clean_text(os.getenv("GEMINI_MODEL"))
     if not raw:
@@ -319,8 +383,12 @@ def call_llm(description: str) -> dict[str, Any]:
     if requests is None:
         raise LLMAdapterError("requests library is not installed")
 
+    groq_api_key = os.getenv("GROQ_API_KEY")
     google_api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     openai_api_key = os.getenv("OPENAI_API_KEY")
+
+    if groq_api_key:
+        return _call_groq_llm(description, groq_api_key)
 
     if google_api_key:
         return _call_gemini_llm(description, google_api_key)
@@ -328,7 +396,9 @@ def call_llm(description: str) -> dict[str, Any]:
     if openai_api_key:
         return _call_openai_llm(description, openai_api_key)
 
-    raise LLMAdapterError("No LLM API key set. Use GOOGLE_API_KEY (or GEMINI_API_KEY) / OPENAI_API_KEY.")
+    raise LLMAdapterError(
+        "No LLM API key set. Use GROQ_API_KEY / GOOGLE_API_KEY (or GEMINI_API_KEY) / OPENAI_API_KEY."
+    )
 
 
 def build_address(ticket: Ticket) -> str:
