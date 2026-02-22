@@ -237,39 +237,82 @@ def _call_openai_llm(description: str, api_key: str) -> dict[str, Any]:
         raise LLMAdapterError(f"OpenAI response parse error: {exc}") from exc
 
 
+def _gemini_models_from_env() -> list[str]:
+    raw = clean_text(os.getenv("GEMINI_MODEL"))
+    if not raw:
+        return ["gemini-2.5-flash", "gemini-2.0-flash"]
+    models = [item.strip() for item in raw.split(",") if item.strip()]
+    return models if models else ["gemini-2.5-flash", "gemini-2.0-flash"]
+
+
+def _gemini_response_text(data: dict[str, Any]) -> str:
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        raise LLMAdapterError(f"Gemini response missing candidates: {data}")
+    first = candidates[0]
+    content = first.get("content") if isinstance(first, dict) else None
+    parts = content.get("parts") if isinstance(content, dict) else None
+    if not isinstance(parts, list) or not parts:
+        raise LLMAdapterError(f"Gemini response missing text parts: {data}")
+    text_part = parts[0]
+    text = text_part.get("text") if isinstance(text_part, dict) else None
+    if not isinstance(text, str):
+        raise LLMAdapterError(f"Gemini response text is empty: {data}")
+    return text
+
+
 def _call_gemini_llm(description: str, api_key: str) -> dict[str, Any]:
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     prompt = _build_llm_prompt(description)
-
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.2,
-            "responseMimeType": "application/json",
+    model_candidates = _gemini_models_from_env()
+    payload_candidates = [
+        {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.2,
+                "responseMimeType": "application/json",
+            },
         },
-    }
+        {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.2,
+            },
+        },
+        {
+            "contents": [{"parts": [{"text": prompt}]}],
+        },
+    ]
 
-    try:
-        response = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            params={"key": api_key},
-            headers={"Content-Type": "application/json"},
-            json=payload,
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
-        content = data["candidates"][0]["content"]["parts"][0]["text"]
-        return _parse_json_response_text(content)
-    except RequestException as exc:
-        raise LLMAdapterError(f"Gemini network error: {exc}") from exc
-    except (KeyError, IndexError, TypeError) as exc:
-        raise LLMAdapterError(f"Gemini response parse error: {exc}") from exc
+    errors: list[str] = []
+    for model in model_candidates:
+        for payload in payload_candidates:
+            try:
+                response = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    params={"key": api_key},
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
+                    timeout=30,
+                )
+                if not response.ok:
+                    body_preview = (response.text or "").strip().replace("\n", " ")
+                    errors.append(f"model={model} status={response.status_code} body={body_preview[:300]}")
+                    continue
+                data = response.json()
+                content = _gemini_response_text(data)
+                return _parse_json_response_text(content)
+            except RequestException as exc:
+                errors.append(f"model={model} request_error={exc}")
+                continue
+            except ValueError as exc:
+                errors.append(f"model={model} non_json_response={exc}")
+                continue
+            except LLMAdapterError as exc:
+                errors.append(f"model={model} parse_error={exc}")
+                continue
+
+    joined = "; ".join(errors[-3:]) if errors else "unknown error"
+    raise LLMAdapterError(f"Gemini request failed for all model/payload options: {joined}")
 
 
 def call_llm(description: str) -> dict[str, Any]:
