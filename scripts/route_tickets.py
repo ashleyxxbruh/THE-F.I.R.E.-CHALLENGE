@@ -145,6 +145,64 @@ SUPPORT_CONTEXT_KEYWORDS = (
     "транзакц",
     "возврат",
 )
+CITY_ALIASES: dict[str, str] = {
+    "aktau": "Актау",
+    "актау": "Актау",
+    "aktobe": "Актобе",
+    "актобе": "Актобе",
+    "atyrau": "Атырау",
+    "атырау": "Атырау",
+    "karaganda": "Караганда",
+    "караганда": "Караганда",
+    "kokshetau": "Кокшетау",
+    "кокшетау": "Кокшетау",
+    "kostanay": "Костанай",
+    "костанай": "Костанай",
+    "kyzylorda": "Кызылорда",
+    "кызылорда": "Кызылорда",
+    "pavlodar": "Павлодар",
+    "павлодар": "Павлодар",
+    "petropavlovsk": "Петропавловск",
+    "петропавловск": "Петропавловск",
+    "taraz": "Тараз",
+    "тараз": "Тараз",
+    "uralsk": "Уральск",
+    "oral": "Уральск",
+    "уральск": "Уральск",
+    "ораль": "Уральск",
+    "ustkamenogorsk": "Усть-Каменогорск",
+    "ust kamenogorsk": "Усть-Каменогорск",
+    "ust-kamenogorsk": "Усть-Каменогорск",
+    "устькаменогорск": "Усть-Каменогорск",
+    "усть каменогорск": "Усть-Каменогорск",
+    "uсть каменогорск": "Усть-Каменогорск",
+    "shymkent": "Шымкент",
+    "шымкент": "Шымкент",
+    "astana": "Астана",
+    "нурсултан": "Астана",
+    "нур султан": "Астана",
+    "нур-султан": "Астана",
+    "almaty": "Алматы",
+    "алматы": "Алматы",
+}
+REGION_TO_OFFICES: dict[str, list[str]] = {
+    "акмолинская": ["Кокшетау", "Астана"],
+    "вко": ["Усть-Каменогорск"],
+    "восточно": ["Усть-Каменогорск"],
+    "семипалатинская": ["Усть-Каменогорск"],
+    "абайская": ["Усть-Каменогорск"],
+    "юко": ["Шымкент"],
+    "туркестанская": ["Шымкент"],
+    "шымкент": ["Шымкент"],
+    "алматинская": ["Алматы"],
+    "павлодарская": ["Павлодар"],
+    "карагандинская": ["Караганда"],
+    "костанайская": ["Костанай"],
+    "атырауская": ["Атырау"],
+    "мангиста": ["Актау"],
+    "западно": ["Уральск"],
+    "урал": ["Уральск"],
+}
 
 KAZAKHSTAN_ALIASES = {"казахстан", "kazakhstan", "kz", "рк", "rk"}
 
@@ -212,6 +270,29 @@ def normalize_spaces_lower(value: Any) -> str:
     if not text:
         return ""
     return " ".join(text.split()).lower()
+
+
+def normalize_place(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    lowered = text.lower().replace("ё", "е")
+    lowered = re.sub(r"[.,/_\\\-()\"'«»]+", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    return lowered
+
+
+def tokenize_place(value: Any) -> list[str]:
+    text = clean_text(value)
+    if not text:
+        return []
+    raw_tokens = re.split(r"[\/|;]", text)
+    tokens: list[str] = []
+    for token in raw_tokens:
+        normalized = normalize_place(token)
+        if normalized and normalized not in tokens:
+            tokens.append(normalized)
+    return tokens
 
 
 def normalize_geo_lookup_text(value: Any) -> str:
@@ -744,6 +825,74 @@ def choose_nearest_office(ticket_lat: float, ticket_lon: float, offices: list[Bu
     )
 
 
+def choose_office_for_ticket(
+    ticket: Ticket,
+    ai_analysis: Optional[AiAnalysis],
+    offices: list[BusinessUnit],
+    fallback_state: dict[str, int],
+) -> tuple[Optional[BusinessUnit], str, Optional[str], Optional[list[str]]]:
+    office_by_normalized_name: dict[str, BusinessUnit] = {
+        normalize_place(office.name): office for office in offices
+    }
+
+    city_tokens = tokenize_place(ticket.city)
+    for token in city_tokens:
+        canonical_name = CITY_ALIASES.get(token)
+        if canonical_name:
+            office = office_by_normalized_name.get(normalize_place(canonical_name))
+            if office is not None:
+                return office, "exact_city_or_alias", None, None
+        direct_match_office = office_by_normalized_name.get(token)
+        if direct_match_office is not None:
+            return direct_match_office, "exact_city_or_alias", None, None
+
+    region_norm = normalize_place(ticket.region)
+    region_candidates_names: list[str] = []
+    if region_norm:
+        for region_key, office_names in REGION_TO_OFFICES.items():
+            if region_key in region_norm:
+                for office_name in office_names:
+                    if office_name not in region_candidates_names:
+                        region_candidates_names.append(office_name)
+
+    region_candidate_offices = [
+        office_by_normalized_name.get(normalize_place(office_name))
+        for office_name in region_candidates_names
+    ]
+    region_candidate_offices = [office for office in region_candidate_offices if office is not None]
+    region_candidates_debug = [office.name for office in region_candidate_offices] if region_candidate_offices else None
+
+    ticket_lat = normalize_coord(ai_analysis.lat if ai_analysis else None)
+    ticket_lon = normalize_coord(ai_analysis.lon if ai_analysis else None)
+
+    if region_candidate_offices:
+        if ticket_lat is not None and ticket_lon is not None:
+            chosen = min(
+                region_candidate_offices,
+                key=lambda office: haversine_km(ticket_lat, ticket_lon, float(office.lat), float(office.lon))
+                if office.lat is not None and office.lon is not None
+                else float("inf"),
+            )
+            return chosen, "region_candidate_nearest", None, region_candidates_debug
+
+        if len(region_candidate_offices) == 1:
+            return region_candidate_offices[0], "region_candidate_no_coords", None, region_candidates_debug
+
+        rr_key = f"region_no_coords_rr:{region_norm}"
+        toggle = fallback_state.get(rr_key, 0) % 2
+        fallback_state[rr_key] = (toggle + 1) % 2
+        return region_candidate_offices[toggle], "region_candidate_no_coords", rr_key, region_candidates_debug
+
+    abroad_or_unknown = is_abroad_or_unknown(ticket.country)
+    if not abroad_or_unknown and ticket_lat is not None and ticket_lon is not None:
+        nearest_global = choose_nearest_office(ticket_lat, ticket_lon, offices)
+        if nearest_global is not None:
+            return nearest_global, "nearest_global", None, None
+
+    fallback_office, fallback_mode = choose_fallback_office(offices, fallback_state)
+    return fallback_office, "fallback_50_50", fallback_mode, None
+
+
 def build_filters(ticket: Ticket, ai_analysis: Optional[AiAnalysis]) -> tuple[dict[str, Any], str]:
     vip_required = is_vip_or_priority(ticket.segment)
     ticket_type = clean_text(ai_analysis.ticket_type if ai_analysis else None) or DEFAULT_TICKET_TYPE
@@ -914,31 +1063,18 @@ def process_ticket(
         "manager_id": None,
     }
 
-    ticket_lat = normalize_coord(ai_analysis.lat if ai_analysis else None)
-    ticket_lon = normalize_coord(ai_analysis.lon if ai_analysis else None)
     ticket_type_value = clean_text(ai_analysis.ticket_type if ai_analysis else None) or DEFAULT_TICKET_TYPE
-    abroad_or_unknown = is_abroad_or_unknown(ticket.country)
-
-    selected_office: Optional[BusinessUnit] = None
-    office_choice = "nearest"
-    primary_office_choice = "nearest"
-    office_fallback_mode = None
-
-    if abroad_or_unknown or ticket_lat is None or ticket_lon is None:
-        selected_office, office_fallback_mode = choose_fallback_office(offices, fallback_state)
-        office_choice = "fallback_50_50"
-        primary_office_choice = office_choice
+    selected_office, office_choice, office_fallback_mode, region_candidates = choose_office_for_ticket(
+        ticket=ticket,
+        ai_analysis=ai_analysis,
+        offices=offices,
+        fallback_state=fallback_state,
+    )
+    primary_office_choice = office_choice
+    if office_choice == "fallback_50_50":
         result["fallback_50_50_count"] = 1
-    else:
-        selected_office = choose_nearest_office(ticket_lat, ticket_lon, offices)
-        if selected_office is None:
-            selected_office, office_fallback_mode = choose_fallback_office(offices, fallback_state)
-            office_choice = "fallback_50_50"
-            primary_office_choice = office_choice
-            result["fallback_50_50_count"] = 1
-        else:
-            primary_office_choice = office_choice
-            result["nearest_office_count"] = 1
+    if office_choice == "nearest_global":
+        result["nearest_office_count"] = 1
 
     if selected_office is None:
         logger.error("No office available for ticket %s; skipping.", ticket.client_guid)
@@ -963,6 +1099,7 @@ def process_ticket(
                         "detected_ticket_type": ticket_type_value,
                         "office_choice": office_choice,
                         "office_name": office.name,
+                        "region_candidates": region_candidates,
                     }
                     values = {
                         "ticket_id": ticket.id,
@@ -1050,6 +1187,7 @@ def process_ticket(
                     "office_choice": office_choice,
                     "office_name": office.name,
                     "office_fallback_mode": office_fallback_mode,
+                    "region_candidates": region_candidates,
                     "primary_office": primary_office_info,
                     "hub_fallback": {
                         "used": hub_fallback_used,
@@ -1092,6 +1230,37 @@ def process_ticket(
         return result
 
     return result
+
+
+def run_geo_self_check(offices: list[BusinessUnit]) -> None:
+    target_ids = [3, 10, 13, 19, 20, 28]
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(Ticket, AiAnalysis)
+            .outerjoin(AiAnalysis, AiAnalysis.ticket_id == Ticket.id)
+            .where(Ticket.id.in_(target_ids))
+            .order_by(Ticket.id.asc())
+        ).all()
+
+    if not rows:
+        print("\nGeo Self Check")
+        print("No target tickets found for ids: 3, 10, 13, 19, 20, 28")
+        return
+
+    local_fallback_state: dict[str, int] = {}
+    print("\nGeo Self Check")
+    for ticket, ai_analysis in rows:
+        office, office_choice, _, region_candidates = choose_office_for_ticket(
+            ticket=ticket,
+            ai_analysis=ai_analysis,
+            offices=offices,
+            fallback_state=local_fallback_state,
+        )
+        print(
+            f"ticket_id={ticket.id} city={clean_text(ticket.city)} region={clean_text(ticket.region)} "
+            f"choice={office_choice} office={(office.name if office else None)} "
+            f"region_candidates={region_candidates}"
+        )
 
 
 def run_spam_sanity_checks(ticket_ids: Optional[list[int]] = None) -> dict[str, int]:
