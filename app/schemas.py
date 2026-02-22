@@ -77,3 +77,46 @@ class TicketDetailOut(BaseModel):
     house_raw: Optional[str] = None
     ai_analysis: Optional[TicketAiAnalysisOut] = None
     assignment: Optional[TicketAssignmentDetailOut] = None
+
+
+class StatsTotalsOut(BaseModel):
+    tickets_total: int
+    assigned: int
+    unassigned: int
+    dropped_spam: int
+
+
+class TicketTypeCountOut(BaseModel):
+    ticket_type: str
+    count: int
+
+
+class SentimentCountOut(BaseModel):
+    sentiment: str
+    count: int
+
+
+class LanguageCountOut(BaseModel):
+    language: str
+    count: int
+
+
+class OfficeAssignedCountOut(BaseModel):
+    office_name: str
+    count: int
+
+
+class ManagerLoadOut(BaseModel):
+    manager_id: int
+    manager_name: str
+    office_name: str
+    current_load: int
+
+
+class StatsOut(BaseModel):
+    totals: StatsTotalsOut
+    by_ticket_type: list[TicketTypeCountOut] = Field(default_factory=list)
+    by_sentiment: list[SentimentCountOut] = Field(default_factory=list)
+    by_language: list[LanguageCountOut] = Field(default_factory=list)
+    by_office_assigned: list[OfficeAssignedCountOut] = Field(default_factory=list)
+    manager_loads: list[ManagerLoadOut] = Field(default_factory=list)

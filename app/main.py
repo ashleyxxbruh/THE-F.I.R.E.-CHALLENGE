@@ -4,19 +4,26 @@ from typing import Any, Generator
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
 from app.models import AiAnalysis, Assignment, BusinessUnit, Manager, Ticket
 from app.schemas import (
+    LanguageCountOut,
+    ManagerLoadOut,
     ManagerOut,
+    OfficeAssignedCountOut,
     OfficeOut,
+    SentimentCountOut,
+    StatsOut,
+    StatsTotalsOut,
     TicketAiAnalysisOut,
     TicketAssignmentDetailOut,
     TicketAssignmentOut,
     TicketDetailOut,
     TicketListItemOut,
+    TicketTypeCountOut,
 )
 
 app = FastAPI()
@@ -146,6 +153,116 @@ def get_managers(db: Session = Depends(get_db)) -> list[ManagerOut]:
         )
         for manager, business_unit_name in rows
     ]
+
+
+# Smoke test:
+# curl "http://127.0.0.1:8000/stats"
+# Expected keys:
+# totals, by_ticket_type, by_sentiment, by_language, by_office_assigned, manager_loads
+@app.get("/stats", response_model=StatsOut)
+def get_stats(db: Session = Depends(get_db)) -> StatsOut:
+    tickets_total = int(db.scalar(select(func.count(Ticket.id))) or 0)
+
+    status_totals = db.execute(
+        select(
+            func.coalesce(
+                func.sum(case((Assignment.status == "ASSIGNED", 1), else_=0)),
+                0,
+            ).label("assigned"),
+            func.coalesce(
+                func.sum(case((Assignment.status == "UNASSIGNED", 1), else_=0)),
+                0,
+            ).label("unassigned"),
+            func.coalesce(
+                func.sum(case((Assignment.status == "DROPPED_SPAM", 1), else_=0)),
+                0,
+            ).label("dropped_spam"),
+        )
+        .select_from(Ticket)
+        .outerjoin(Assignment, Assignment.ticket_id == Ticket.id)
+    ).one()
+
+    ticket_type_expr = func.coalesce(AiAnalysis.ticket_type, "UNKNOWN")
+    by_ticket_type_rows = db.execute(
+        select(ticket_type_expr.label("ticket_type"), func.count(Ticket.id).label("count"))
+        .select_from(Ticket)
+        .outerjoin(AiAnalysis, AiAnalysis.ticket_id == Ticket.id)
+        .group_by(ticket_type_expr)
+        .order_by(func.count(Ticket.id).desc(), ticket_type_expr.asc())
+    ).all()
+
+    sentiment_expr = func.coalesce(AiAnalysis.sentiment, "UNKNOWN")
+    by_sentiment_rows = db.execute(
+        select(sentiment_expr.label("sentiment"), func.count(Ticket.id).label("count"))
+        .select_from(Ticket)
+        .outerjoin(AiAnalysis, AiAnalysis.ticket_id == Ticket.id)
+        .group_by(sentiment_expr)
+        .order_by(func.count(Ticket.id).desc(), sentiment_expr.asc())
+    ).all()
+
+    language_expr = func.coalesce(AiAnalysis.language, "UNKNOWN")
+    by_language_rows = db.execute(
+        select(language_expr.label("language"), func.count(Ticket.id).label("count"))
+        .select_from(Ticket)
+        .outerjoin(AiAnalysis, AiAnalysis.ticket_id == Ticket.id)
+        .group_by(language_expr)
+        .order_by(func.count(Ticket.id).desc(), language_expr.asc())
+    ).all()
+
+    by_office_assigned_rows = db.execute(
+        select(BusinessUnit.name.label("office_name"), func.count(Assignment.ticket_id).label("count"))
+        .select_from(Assignment)
+        .join(BusinessUnit, BusinessUnit.id == Assignment.business_unit_id)
+        .where(Assignment.status == "ASSIGNED")
+        .group_by(BusinessUnit.name)
+        .order_by(func.count(Assignment.ticket_id).desc(), BusinessUnit.name.asc())
+    ).all()
+
+    manager_load_rows = db.execute(
+        select(
+            Manager.id.label("manager_id"),
+            Manager.full_name.label("manager_name"),
+            BusinessUnit.name.label("office_name"),
+            Manager.current_load.label("current_load"),
+        )
+        .select_from(Manager)
+        .join(BusinessUnit, BusinessUnit.id == Manager.business_unit_id)
+        .order_by(Manager.current_load.desc(), BusinessUnit.name.asc(), Manager.id.asc())
+    ).all()
+
+    return StatsOut(
+        totals=StatsTotalsOut(
+            tickets_total=tickets_total,
+            assigned=int(status_totals.assigned or 0),
+            unassigned=int(status_totals.unassigned or 0),
+            dropped_spam=int(status_totals.dropped_spam or 0),
+        ),
+        by_ticket_type=[
+            TicketTypeCountOut(ticket_type=str(row.ticket_type), count=int(row.count))
+            for row in by_ticket_type_rows
+        ],
+        by_sentiment=[
+            SentimentCountOut(sentiment=str(row.sentiment), count=int(row.count))
+            for row in by_sentiment_rows
+        ],
+        by_language=[
+            LanguageCountOut(language=str(row.language), count=int(row.count))
+            for row in by_language_rows
+        ],
+        by_office_assigned=[
+            OfficeAssignedCountOut(office_name=str(row.office_name), count=int(row.count))
+            for row in by_office_assigned_rows
+        ],
+        manager_loads=[
+            ManagerLoadOut(
+                manager_id=int(row.manager_id),
+                manager_name=str(row.manager_name),
+                office_name=str(row.office_name),
+                current_load=int(row.current_load or 0),
+            )
+            for row in manager_load_rows
+        ],
+    )
 
 
 @app.get("/tickets", response_model=list[TicketListItemOut])
