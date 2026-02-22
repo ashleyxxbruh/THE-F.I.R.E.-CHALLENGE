@@ -45,6 +45,106 @@ DEFAULT_TICKET_TYPE = "Консультация"
 DEFAULT_LANGUAGE = "RU"
 STATUS_ASSIGNED = "ASSIGNED"
 STATUS_UNASSIGNED = "UNASSIGNED"
+STATUS_DROPPED_SPAM = "DROPPED_SPAM"
+SPAM_TICKET_CANONICAL = "\u0441\u043f\u0430\u043c"
+SPAM_TICKET_LABEL = "\u0421\u043f\u0430\u043c"
+SPAM_URL_MARKERS = (
+    "http://",
+    "https://",
+    "www.",
+    "safelinks.protection.outlook.com",
+    "t.me",
+    "bit.ly",
+    "wa.me",
+)
+SPAM_INVITE_EVENT_KEYWORDS = (
+    "приглаша",
+    "приглашение",
+    "мероприят",
+    "вебинар",
+    "семинар",
+    "конференц",
+    "форум",
+    "день инвестора",
+    "презентац",
+    "roadshow",
+    "инвестор",
+    "инвестора",
+)
+SPAM_CTA_KEYWORDS = (
+    "регистрац",
+    "зарегистр",
+    "ссылка",
+    "перейдите",
+    "подробнее",
+    "участие",
+)
+SPAM_MARKETING_KEYWORDS = (
+    "топ-",
+    "рейтинг",
+    "победител",
+    "лидер",
+    "эмитент",
+    "облигац",
+    "esg",
+    "raex",
+    "эксперт ра",
+)
+SPAM_AD_KEYWORDS = (
+    "в наличии",
+    "отгрузка",
+    "минимальный заказ",
+    "оптом",
+    "цена",
+    "скидка",
+    "акция",
+    "предложение",
+    "купить",
+    "заказать",
+    "доставка",
+    "welding",
+    "aggregat",
+    "агрегат",
+    "свароч",
+    "тюльпан",
+    "розы",
+    "продам",
+    "продажа",
+)
+SPAM_DATE_MONTH_KEYWORDS = (
+    "феврал",
+    "марта",
+    "апрел",
+    "мая",
+    "июн",
+    "июл",
+    "август",
+    "сентябр",
+    "октябр",
+    "ноябр",
+    "декабр",
+)
+SUPPORT_CONTEXT_KEYWORDS = (
+    "не работает",
+    "ошибк",
+    "вход",
+    "логин",
+    "парол",
+    "перевод",
+    "карта",
+    "счет",
+    "счёт",
+    "заблок",
+    "комисси",
+    "мошенн",
+    "верификац",
+    "смс",
+    "приложени",
+    "платеж",
+    "платёж",
+    "транзакц",
+    "возврат",
+)
 
 KAZAKHSTAN_ALIASES = {"казахстан", "kazakhstan", "kz", "рк", "rk"}
 
@@ -204,6 +304,94 @@ def is_vip_or_priority(segment: Any) -> bool:
 
 def is_data_change(ticket_type: Any) -> bool:
     return normalize_spaces_lower(ticket_type) == normalize_spaces_lower("Смена данных")
+
+
+def is_spam(ticket_type: Any) -> bool:
+    return normalize_spaces_lower(ticket_type) == SPAM_TICKET_CANONICAL
+
+
+def is_spam_heuristic(ticket: Ticket, ai_analysis: Optional[AiAnalysis]) -> tuple[bool, dict[str, Any]]:
+    description = clean_text(ticket.description) or ""
+    summary = clean_text(ai_analysis.summary if ai_analysis else None) or ""
+    combined = " ".join(part for part in (description, summary) if part).strip()
+    normalized = normalize_spaces_lower(combined)
+
+    url_hits = [marker for marker in SPAM_URL_MARKERS if marker in normalized]
+    invite_hits = [keyword for keyword in SPAM_INVITE_EVENT_KEYWORDS if keyword in normalized]
+    cta_hits = [keyword for keyword in SPAM_CTA_KEYWORDS if keyword in normalized]
+    marketing_hits = [keyword for keyword in SPAM_MARKETING_KEYWORDS if keyword in normalized]
+    ad_hits = [keyword for keyword in SPAM_AD_KEYWORDS if keyword in normalized]
+    date_hits = [keyword for keyword in SPAM_DATE_MONTH_KEYWORDS if keyword in normalized]
+    has_time_pattern = bool(re.search(r"\b\d{1,2}:\d{2}\b", normalized))
+    support_hits = [keyword for keyword in SUPPORT_CONTEXT_KEYWORDS if keyword in normalized]
+
+    link_detected = len(url_hits) > 0
+    invite_detected = len(invite_hits) > 0
+    cta_detected = len(cta_hits) > 0
+    marketing_detected = len(marketing_hits) > 0 or len(ad_hits) > 0
+    date_detected = len(date_hits) > 0 or has_time_pattern
+    support_detected = len(support_hits) > 0
+
+    score = 0
+    if link_detected:
+        score += 3
+    if invite_detected:
+        score += 2
+    if cta_detected:
+        score += 2
+    if marketing_detected:
+        score += 1
+    if date_detected:
+        score += 1
+
+    trigger_rule = None
+    is_spam_like = False
+    if score >= 5:
+        is_spam_like = True
+        trigger_rule = "score_threshold"
+    if link_detected and invite_detected:
+        is_spam_like = True
+        trigger_rule = "link_and_invite"
+
+    suppression_triggered = False
+    if support_detected and score < 7:
+        suppression_triggered = True
+        is_spam_like = False
+        trigger_rule = "support_suppression"
+
+    matched_categories = []
+    if link_detected:
+        matched_categories.append("link")
+    if invite_detected:
+        matched_categories.append("invite_event")
+    if cta_detected:
+        matched_categories.append("registration_cta")
+    if marketing_detected:
+        matched_categories.append("marketing")
+    if date_detected:
+        matched_categories.append("date_time")
+    if support_detected:
+        matched_categories.append("support_context")
+
+    matched_keywords = {
+        "link": url_hits,
+        "invite_event": invite_hits,
+        "registration_cta": cta_hits,
+        "marketing": marketing_hits + ad_hits,
+        "date_time": date_hits + (["time_pattern"] if has_time_pattern else []),
+        "support_context": support_hits,
+    }
+
+    debug_info: dict[str, Any] = {
+        "score": score,
+        "matched_keywords": matched_keywords,
+        "matched_categories": matched_categories,
+        "link_detected": link_detected,
+        "suppression_triggered": suppression_triggered,
+        "trigger_rule": trigger_rule,
+        "text_length": len(normalized),
+    }
+    return is_spam_like, debug_info
 
 
 def is_main_specialist(position: Any) -> bool:
@@ -719,12 +907,16 @@ def process_ticket(
         "fallback_50_50_count": 0,
         "nearest_office_count": 0,
         "hub_fallback_count": 0,
+        "dropped_spam_count": 0,
+        "spam_source": None,
+        "spam_score": None,
         "office_name": None,
         "manager_id": None,
     }
 
     ticket_lat = normalize_coord(ai_analysis.lat if ai_analysis else None)
     ticket_lon = normalize_coord(ai_analysis.lon if ai_analysis else None)
+    ticket_type_value = clean_text(ai_analysis.ticket_type if ai_analysis else None) or DEFAULT_TICKET_TYPE
     abroad_or_unknown = is_abroad_or_unknown(ticket.country)
 
     selected_office: Optional[BusinessUnit] = None
@@ -750,6 +942,49 @@ def process_ticket(
 
     if selected_office is None:
         logger.error("No office available for ticket %s; skipping.", ticket.client_guid)
+        return result
+
+    spam_by_label = is_spam(ticket_type_value)
+    spam_by_heuristic, spam_debug_info = is_spam_heuristic(ticket, ai_analysis)
+    if spam_by_label or spam_by_heuristic:
+        spam_source = "ai_label" if spam_by_label else "heuristic"
+        try:
+            with SessionLocal() as session:
+                with session.begin():
+                    office = session.get(BusinessUnit, selected_office.id)
+                    if office is None:
+                        raise RuntimeError(f"Office id {selected_office.id} not found during spam drop")
+
+                    reason = {
+                        "dropped_reason": "spam",
+                        "spam_source": spam_source,
+                        "spam_debug": spam_debug_info if spam_by_heuristic else None,
+                        "ticket_type": SPAM_TICKET_LABEL,
+                        "detected_ticket_type": ticket_type_value,
+                        "office_choice": office_choice,
+                        "office_name": office.name,
+                    }
+                    values = {
+                        "ticket_id": ticket.id,
+                        "business_unit_id": office.id,
+                        "manager_id": None,
+                        "status": STATUS_DROPPED_SPAM,
+                        "reason": reason,
+                    }
+                    upsert_assignment(session, values)
+
+                    result["office_name"] = office.name
+                    result["manager_id"] = None
+                    result["dropped_spam_count"] = 1
+                    result["spam_source"] = spam_source
+                    result["spam_score"] = spam_debug_info.get("score") if spam_debug_info else None
+        except Exception as exc:  # pragma: no cover
+            if debug:
+                logger.exception("Spam drop failed for ticket %s", ticket.client_guid)
+            else:
+                logger.error("Spam drop failed for ticket %s: %s", ticket.client_guid, exc)
+            return result
+
         return result
 
     filters, bucket = build_filters(ticket, ai_analysis)
@@ -859,6 +1094,56 @@ def process_ticket(
     return result
 
 
+def run_spam_sanity_checks(ticket_ids: Optional[list[int]] = None) -> dict[str, int]:
+    with SessionLocal() as session:
+        stmt = (
+            select(Ticket, AiAnalysis, Assignment)
+            .outerjoin(AiAnalysis, AiAnalysis.ticket_id == Ticket.id)
+            .outerjoin(Assignment, Assignment.ticket_id == Ticket.id)
+        )
+        if ticket_ids:
+            stmt = stmt.where(Ticket.id.in_(ticket_ids))
+        rows = session.execute(stmt).all()
+
+    checked = 0
+    label_spam_cases = 0
+    heuristic_spam_cases = 0
+    for ticket, ai_analysis, assignment in rows:
+        checked += 1
+
+        ticket_type_value = clean_text(ai_analysis.ticket_type if ai_analysis else None)
+        label_spam = is_spam(ticket_type_value)
+        heuristic_spam, _ = is_spam_heuristic(ticket, ai_analysis)
+        detected_spam = label_spam or heuristic_spam
+
+        if detected_spam and assignment is not None and assignment.status == STATUS_ASSIGNED:
+            raise AssertionError(
+                f"Detected spam ticket assigned to manager: ticket_id={ticket.id}, client_guid={ticket.client_guid}"
+            )
+
+        if label_spam:
+            label_spam_cases += 1
+
+        if heuristic_spam:
+            heuristic_spam_cases += 1
+            if assignment is None or assignment.status != STATUS_DROPPED_SPAM:
+                raise AssertionError(
+                    "Heuristic spam ticket is not DROPPED_SPAM: "
+                    f"ticket_id={ticket.id}, client_guid={ticket.client_guid}, "
+                    f"status={(assignment.status if assignment else None)}"
+                )
+            if assignment.manager_id is not None:
+                raise AssertionError(
+                    f"Heuristic spam ticket has manager assigned: ticket_id={ticket.id}, manager_id={assignment.manager_id}"
+                )
+
+    return {
+        "checked_tickets": checked,
+        "label_spam_cases": label_spam_cases,
+        "heuristic_spam_cases": heuristic_spam_cases,
+    }
+
+
 def manager_loads_report() -> list[tuple[str, str, int]]:
     with SessionLocal() as session:
         rows = session.execute(
@@ -885,6 +1170,16 @@ def main() -> None:
         action="store_true",
         help="Skip Nominatim office geocoding; use existing coordinates and city-centroid fallback only.",
     )
+    parser.add_argument(
+        "--self-check-spam",
+        action="store_true",
+        help="Run lightweight post-routing assertions for spam drop invariants.",
+    )
+    parser.add_argument(
+        "--print-spam",
+        action="store_true",
+        help="Print dropped spam tickets with source and heuristic score.",
+    )
     args = parser.parse_args()
 
     configure_logging(debug=args.debug)
@@ -904,6 +1199,7 @@ def main() -> None:
         print("processed: 0")
         print("assigned: 0")
         print("unassigned: 0")
+        print("dropped_spam: 0")
         print("fallback_50_50_count: 0")
         print("nearest_office_count: 0")
         print("hub_fallback_count: 0")
@@ -916,11 +1212,14 @@ def main() -> None:
     rr_state: dict[tuple[int, str], int] = {}
     fallback_state: dict[str, int] = {}
     per_office_assigned = defaultdict(int)
+    processed_ticket_ids: list[int] = []
+    dropped_spam_items: list[dict[str, Any]] = []
 
     total_selected = len(ticket_rows)
     processed = 0
     assigned = 0
     unassigned = 0
+    dropped_spam_count = 0
     fallback_50_50_count = 0
     nearest_office_count = 0
     hub_fallback_count = 0
@@ -936,11 +1235,22 @@ def main() -> None:
                 fallback_state=fallback_state,
                 debug=args.debug,
             )
+            processed_ticket_ids.append(ticket.id)
             assigned += int(item["assigned"])
             unassigned += int(item["unassigned"])
+            dropped_spam_count += int(item["dropped_spam_count"])
             fallback_50_50_count += int(item["fallback_50_50_count"])
             nearest_office_count += int(item["nearest_office_count"])
             hub_fallback_count += int(item["hub_fallback_count"])
+            if item["dropped_spam_count"]:
+                dropped_spam_items.append(
+                    {
+                        "ticket_id": ticket.id,
+                        "client_guid": ticket.client_guid,
+                        "spam_source": item["spam_source"],
+                        "score": item["spam_score"],
+                    }
+                )
             if item["assigned"] and item["office_name"]:
                 per_office_assigned[item["office_name"]] += 1
         except Exception as exc:  # pragma: no cover
@@ -949,6 +1259,20 @@ def main() -> None:
             else:
                 logger.error("Unexpected failure for ticket %s: %s", ticket.client_guid, exc)
 
+    if args.self_check_spam:
+        spam_check_stats = run_spam_sanity_checks(ticket_ids=processed_ticket_ids)
+        logger.info("Spam sanity checks passed: %s", spam_check_stats)
+
+    if args.print_spam and dropped_spam_items:
+        print("\nDropped Spam Tickets")
+        for spam_item in dropped_spam_items:
+            print(
+                f"ticket_id={spam_item['ticket_id']} "
+                f"client_guid={spam_item['client_guid']} "
+                f"source={spam_item['spam_source']} "
+                f"score={spam_item['score']}"
+            )
+
     loads = manager_loads_report()
 
     print("\nRouting Report")
@@ -956,6 +1280,7 @@ def main() -> None:
     print(f"processed: {processed}")
     print(f"assigned: {assigned}")
     print(f"unassigned: {unassigned}")
+    print(f"dropped_spam: {dropped_spam_count}")
     print(f"fallback_50_50_count: {fallback_50_50_count}")
     print(f"nearest_office_count: {nearest_office_count}")
     print(f"hub_fallback_count: {hub_fallback_count}")
