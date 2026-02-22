@@ -24,7 +24,9 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -69,6 +71,30 @@ DEFAULT_RECOMMENDATION = "Проверьте детали обращения и 
 
 ALMATY_COORDS = (43.238949, 76.889709)
 ASTANA_COORDS = (51.169392, 71.449074)
+
+CITY_CENTROIDS: dict[str, tuple[float, float]] = {
+    "алматы": ALMATY_COORDS,
+    "алматин": ALMATY_COORDS,
+    "астана": ASTANA_COORDS,
+    "нур-султан": ASTANA_COORDS,
+    "нур султан": ASTANA_COORDS,
+    "шымкент": (42.3417, 69.5901),
+    "караганд": (49.8047, 73.1094),
+    "павлодар": (52.2873, 76.9674),
+    "усть-каменогорск": (49.9483, 82.6289),
+    "оскемен": (49.9483, 82.6289),
+    "кокшетау": (53.2833, 69.3833),
+    "костанай": (53.2144, 63.6246),
+    "атырау": (47.1126, 51.9235),
+    "актобе": (50.2839, 57.1669),
+    "актау": (43.6511, 51.1978),
+    "тараз": (42.9006, 71.3658),
+    "уральск": (51.2278, 51.3865),
+    "орал": (51.2278, 51.3865),
+    "петропавловск": (54.8753, 69.1628),
+    "кызылорда": (44.8488, 65.4823),
+    "туркестан": (43.2973, 68.2518),
+}
 
 
 class LLMAdapterError(Exception):
@@ -401,48 +427,151 @@ def call_llm(description: str) -> dict[str, Any]:
     )
 
 
-def build_address(ticket: Ticket) -> str:
-    parts = [
-        clean_text(ticket.country),
-        clean_text(ticket.region),
-        clean_text(ticket.city),
-        clean_text(ticket.street),
-        clean_text(ticket.house_raw),
-    ]
-    return ", ".join(part for part in parts if part)
+def _join_geo_parts(*parts: Optional[str]) -> Optional[str]:
+    cleaned_parts = [clean_text(part) for part in parts]
+    values = [part for part in cleaned_parts if part]
+    if not values:
+        return None
+    return ", ".join(values)
 
 
-def geocode_nominatim(address: str, cache: dict[str, Optional[tuple[float, float]]]) -> Optional[tuple[float, float]]:
-    if not address:
+def _append_unique(queries: list[str], value: Optional[str]) -> None:
+    query = clean_text(value)
+    if not query:
+        return
+    if query not in queries:
+        queries.append(query)
+
+
+def normalize_region_for_geocoding(region: Optional[str]) -> Optional[str]:
+    text = clean_text(region)
+    if not text:
         return None
 
-    if address in cache:
-        return cache[address]
+    normalized = text.replace("\\", "/")
+    if "/" in normalized:
+        parts = [part.strip() for part in normalized.split("/") if part.strip()]
+        if parts:
+            normalized = parts[-1]
 
-    if requests is None:
-        cache[address] = None
-        return None
+    normalized = re.sub(r"\b(обл\.?|область|облысы|район|р-н)\b", " ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"[(){}\[\];:]", " ", normalized)
+    normalized = re.sub(r"[,.]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" -")
+    return normalized or None
 
-    try:
-        response = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={"q": address, "format": "json", "limit": 1},
-            headers={"User-Agent": "fire-hackathon-ai-enricher/1.0"},
-            timeout=15,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, list) and payload:
-            first = payload[0]
-            lat = float(first["lat"])
-            lon = float(first["lon"])
-            cache[address] = (lat, lon)
-            return cache[address]
-    except (RequestException, ValueError, KeyError, TypeError):
-        pass
 
-    cache[address] = None
-    return None
+def city_variants_for_geocoding(city: Optional[str]) -> list[str]:
+    city_text = clean_text(city)
+    if not city_text:
+        return []
+
+    variants: list[str] = []
+    _append_unique(variants, city_text)
+
+    if "/" in city_text:
+        slash_parts = [clean_text(part) for part in city_text.split("/")]
+        slash_parts = [part for part in slash_parts if part]
+        if slash_parts:
+            _append_unique(variants, ", ".join(slash_parts))
+            for part in slash_parts:
+                _append_unique(variants, part)
+
+    if "(" in city_text and ")" in city_text:
+        main_city = re.sub(r"\(.*?\)", "", city_text).strip(" ,")
+        _append_unique(variants, main_city)
+        inside_parts = re.findall(r"\(([^)]+)\)", city_text)
+        for inside in inside_parts:
+            _append_unique(variants, inside)
+
+    return variants
+
+
+def build_geocode_queries(ticket: Ticket) -> list[str]:
+    country = clean_text(ticket.country)
+    region_raw = clean_text(ticket.region)
+    region_clean = normalize_region_for_geocoding(region_raw)
+    street = clean_text(ticket.street)
+    house = clean_text(ticket.house_raw)
+    city_variants = city_variants_for_geocoding(ticket.city)
+
+    queries: list[str] = []
+    if not city_variants:
+        city_variants = [None]
+
+    def add_for_city(city_value: Optional[str]) -> None:
+        # a) full
+        _append_unique(queries, _join_geo_parts(country, region_raw, city_value, street, house))
+        if region_clean and region_clean != region_raw:
+            _append_unique(queries, _join_geo_parts(country, region_clean, city_value, street, house))
+
+        # b) street-level
+        _append_unique(queries, _join_geo_parts(country, region_raw, city_value, street))
+        if region_clean and region_clean != region_raw:
+            _append_unique(queries, _join_geo_parts(country, region_clean, city_value, street))
+
+        # c) city-level
+        _append_unique(queries, _join_geo_parts(country, region_raw, city_value))
+        if region_clean and region_clean != region_raw:
+            _append_unique(queries, _join_geo_parts(country, region_clean, city_value))
+
+        # d) city + Kazakhstan
+        _append_unique(queries, _join_geo_parts(city_value, "Казахстан"))
+
+    add_for_city(city_variants[0])
+    for city_variant in city_variants[1:]:
+        add_for_city(city_variant)
+
+    return queries
+
+
+def geocode_nominatim(
+    queries: list[str],
+    cache: dict[str, Optional[tuple[float, float]]],
+) -> tuple[Optional[tuple[float, float]], Optional[str]]:
+    if not queries:
+        return None, None
+
+    for raw_query in queries:
+        query = clean_text(raw_query)
+        if not query:
+            continue
+
+        if query in cache:
+            cached_value = cache[query]
+            if cached_value is not None:
+                return cached_value, query
+            continue
+
+        if requests is None:
+            cache[query] = None
+            continue
+
+        did_request = False
+        try:
+            response = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": query, "format": "json", "limit": 1},
+                headers={"User-Agent": "fire-hackathon-ai-enricher/1.0"},
+                timeout=15,
+            )
+            did_request = True
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, list) and payload:
+                first = payload[0]
+                lat = float(first["lat"])
+                lon = float(first["lon"])
+                cache[query] = (lat, lon)
+                return cache[query], query
+            cache[query] = None
+        except (RequestException, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            cache[query] = None
+        finally:
+            if did_request:
+                time.sleep(1.0)
+
+    return None, None
 
 
 def fallback_city_centroid(city: Optional[str]) -> Optional[tuple[float, float]]:
@@ -451,10 +580,9 @@ def fallback_city_centroid(city: Optional[str]) -> Optional[tuple[float, float]]
         return None
 
     city_lc = text.lower()
-    if "алматы" in city_lc:
-        return ALMATY_COORDS
-    if "астана" in city_lc or "нур-султан" in city_lc:
-        return ASTANA_COORDS
+    for city_pattern, coords in CITY_CENTROIDS.items():
+        if city_pattern in city_lc:
+            return coords
     return None
 
 
@@ -539,15 +667,34 @@ def process_ticket(
         failed_ai_parses += 1
         logger.warning("Invalid AI JSON for ticket %s. Applied fallback defaults.", ticket.client_guid)
 
-    address = build_address(ticket)
-    coords = geocode_nominatim(address, geocode_cache) if address else None
-    if coords is None:
+    geocode_queries = build_geocode_queries(ticket)
+    coords, geocode_query = geocode_nominatim(geocode_queries, geocode_cache)
+    if coords is not None:
+        if debug:
+            logger.debug(
+                "Geocode ok for ticket %s: query='%s' source=nominatim",
+                ticket.client_guid,
+                geocode_query,
+            )
+    else:
         city_coords = fallback_city_centroid(ticket.city)
         if city_coords is not None:
             coords = city_coords
             used_fallback_city_centroid = 1
+            if debug:
+                logger.debug(
+                    "Geocode ok for ticket %s: city='%s' source=centroid",
+                    ticket.client_guid,
+                    clean_text(ticket.city),
+                )
         else:
             failed_geocodes = 1
+            if debug:
+                logger.debug(
+                    "Geocode failed for ticket %s. Tried queries: %s",
+                    ticket.client_guid,
+                    geocode_queries,
+                )
 
     lat = coords[0] if coords else None
     lon = coords[1] if coords else None
