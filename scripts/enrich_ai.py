@@ -1,12 +1,14 @@
 """
 Run (PowerShell):
   $env:DATABASE_URL="postgresql+psycopg2://user:pass@localhost:5432/db"
+  $env:GOOGLE_API_KEY="your_google_ai_studio_key"
   python scripts/enrich_ai.py
   python scripts/enrich_ai.py --force
   python scripts/enrich_ai.py --limit 10
 
 Run (bash):
   export DATABASE_URL=postgresql+psycopg2://user:pass@localhost:5432/db
+  export GOOGLE_API_KEY=your_google_ai_studio_key
   python scripts/enrich_ai.py
   python scripts/enrich_ai.py --force
   python scripts/enrich_ai.py --limit 10
@@ -151,16 +153,51 @@ def validate_ai_payload(payload: Any, description: Optional[str]) -> tuple[dict[
     return result, payload, False
 
 
-def call_llm(description: str) -> dict[str, Any]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise LLMAdapterError("OPENAI_API_KEY is not set")
-
-    if requests is None:
-        raise LLMAdapterError("requests library is not installed")
-
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+def _build_llm_prompt(description: str) -> str:
     prompt_description = description.strip() if description else ""
+    ticket_types = ", ".join(sorted(ALLOWED_TICKET_TYPES))
+    sentiments = ", ".join(sorted(ALLOWED_SENTIMENTS))
+    return (
+        "Classify this client support ticket and return ONLY a JSON object with keys: "
+        "ticket_type, sentiment, priority, language, summary, recommendation.\n\n"
+        f"Ticket description:\n{prompt_description}\n\n"
+        f"Allowed ticket_type values: {ticket_types}\n"
+        f"Allowed sentiment values: {sentiments}\n"
+        "priority: integer from 1 to 10\n"
+        "language: one of KZ, ENG, RU\n"
+        "summary: 1-2 sentences\n"
+        "recommendation: short next steps for manager"
+    )
+
+
+def _parse_json_response_text(text: str) -> dict[str, Any]:
+    if text is None:
+        raise LLMAdapterError("LLM response content is empty")
+
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise LLMAdapterError(f"LLM JSON decode error: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise LLMAdapterError("LLM response is not a JSON object")
+    return parsed
+
+
+def _call_openai_llm(description: str, api_key: str) -> dict[str, Any]:
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    prompt = _build_llm_prompt(description)
 
     payload = {
         "model": model,
@@ -168,24 +205,11 @@ def call_llm(description: str) -> dict[str, Any]:
         "messages": [
             {
                 "role": "system",
-                "content": (
-                    "Ты классифицируешь клиентские обращения. "
-                    "Верни только JSON с ключами: ticket_type, sentiment, priority, language, summary, recommendation."
-                ),
+                "content": "Return only a valid JSON object.",
             },
             {
                 "role": "user",
-                "content": (
-                    "Описание обращения:\n"
-                    f"{prompt_description}\n\n"
-                    "Допустимые ticket_type: Жалоба, Смена данных, Консультация, Претензия, "
-                    "Неработоспособность приложения, Мошеннические действия, Спам.\n"
-                    "Допустимые sentiment: Позитивный, Нейтральный, Негативный.\n"
-                    "priority: целое 1..10.\n"
-                    "language: KZ, ENG или RU.\n"
-                    "summary: 1-2 предложения.\n"
-                    "recommendation: короткие следующие шаги для менеджера."
-                ),
+                "content": prompt,
             },
         ],
         "temperature": 0.2,
@@ -206,15 +230,62 @@ def call_llm(description: str) -> dict[str, Any]:
         response.raise_for_status()
         data = response.json()
         content = data["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
+        return _parse_json_response_text(content)
     except RequestException as exc:
-        raise LLMAdapterError(f"LLM network error: {exc}") from exc
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        raise LLMAdapterError(f"LLM response parse error: {exc}") from exc
+        raise LLMAdapterError(f"OpenAI network error: {exc}") from exc
+    except (KeyError, IndexError, TypeError) as exc:
+        raise LLMAdapterError(f"OpenAI response parse error: {exc}") from exc
 
-    if not isinstance(parsed, dict):
-        raise LLMAdapterError("LLM response is not a JSON object")
-    return parsed
+
+def _call_gemini_llm(description: str, api_key: str) -> dict[str, Any]:
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    prompt = _build_llm_prompt(description)
+
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    try:
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            params={"key": api_key},
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        content = data["candidates"][0]["content"]["parts"][0]["text"]
+        return _parse_json_response_text(content)
+    except RequestException as exc:
+        raise LLMAdapterError(f"Gemini network error: {exc}") from exc
+    except (KeyError, IndexError, TypeError) as exc:
+        raise LLMAdapterError(f"Gemini response parse error: {exc}") from exc
+
+
+def call_llm(description: str) -> dict[str, Any]:
+    if requests is None:
+        raise LLMAdapterError("requests library is not installed")
+
+    google_api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+
+    if google_api_key:
+        return _call_gemini_llm(description, google_api_key)
+
+    if openai_api_key:
+        return _call_openai_llm(description, openai_api_key)
+
+    raise LLMAdapterError("No LLM API key set. Use GOOGLE_API_KEY (or GEMINI_API_KEY) / OPENAI_API_KEY.")
 
 
 def build_address(ticket: Ticket) -> str:
